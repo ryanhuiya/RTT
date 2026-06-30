@@ -268,7 +268,9 @@ class ManualRTT:
 class RTT_GUI:
     DEFAULT_TARGET_TYPE = "cortex_m"
     PROBE_RELEASE_COOLDOWN = 0.15
+    AUTO_RECONNECT_DELAY = 1.0
     MAX_READ_ERRORS = 100
+    READ_ERROR_LOG_INTERVAL = 20
     RX_IDLE_SLEEP = 0.01
     RX_ERROR_SLEEP = 0.05
 
@@ -305,6 +307,9 @@ class RTT_GUI:
         self.clear_btn = tk.Button(config_frame, text="Clear", command=self.clear_log_area, width=8,
                                    bg="#2f3a45", fg="#dbe7f3", activeforeground="#ffffff")
         self.clear_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.status_var = tk.StringVar(value="未连接")
+        self.status_label = tk.Label(config_frame, textvariable=self.status_var, fg="#666666")
+        self.status_label.pack(side=tk.LEFT, padx=(12, 0))
 
         # UI: 日志区
         self.log_area = scrolledtext.ScrolledText(root, state='disabled', bg="black", fg="#00FF00", font=("Consolas", 10))
@@ -332,6 +337,7 @@ class RTT_GUI:
         self.cleanup_in_progress = False
         self.pending_reconnect = False
         self.pending_reconnect_path = ""
+        self.pending_reconnect_delay = None
         self.cleanup_token = 0
         self.closing = False
         self.io_thread = None
@@ -474,13 +480,11 @@ class RTT_GUI:
             return
         map_path = self.path_var.get().strip()
         if self.io_thread and self.io_thread.is_alive():
-            self.pending_reconnect = True
-            self.pending_reconnect_path = map_path
+            self.queue_reconnect(map_path)
             self.log(">>> 上一次连接操作还在退出，结束后将自动重连。", "sys")
             return
         if self.cleanup_in_progress:
-            self.pending_reconnect = True
-            self.pending_reconnect_path = map_path
+            self.queue_reconnect(map_path)
             self.log(">>> 正在释放探针资源，完成后将自动重连。", "sys")
             return
         self.begin_connect(map_path)
@@ -511,6 +515,7 @@ class RTT_GUI:
         map_path = self.pending_reconnect_path or self.path_var.get().strip()
         self.pending_reconnect = False
         self.pending_reconnect_path = ""
+        self.pending_reconnect_delay = None
         self.log(">>> 资源已释放，正在自动重连...", "sys")
         self.begin_connect(map_path)
 
@@ -523,6 +528,9 @@ class RTT_GUI:
             self.ui_call(self.start_pending_reconnect)
 
     def start_cleanup_cooldown(self, delay=None):
+        if delay is None and self.pending_reconnect_delay is not None:
+            delay = self.pending_reconnect_delay
+            self.pending_reconnect_delay = None
         delay = self.PROBE_RELEASE_COOLDOWN if delay is None else delay
         self.cleanup_token += 1
         token = self.cleanup_token
@@ -537,6 +545,14 @@ class RTT_GUI:
     def format_exception(self, exc):
         text = str(exc).strip()
         return text if text else exc.__class__.__name__
+
+    def set_status(self, text):
+        self.status_var.set(text)
+
+    def queue_reconnect(self, map_path, delay=None):
+        self.pending_reconnect = True
+        self.pending_reconnect_path = map_path
+        self.pending_reconnect_delay = delay
 
     def release_probe_now(self, session=None, probe=None):
         probe = probe or getattr(session, "probe", None)
@@ -714,8 +730,10 @@ class RTT_GUI:
 
         rtt_addr = int(addr_str, 16)
         self.log(f">>> 目标地址: {hex(rtt_addr)}", "sys")
+        self.ui_call(self.set_status, "搜索调试器...")
         self.log(">>> 正在搜索调试器...", "sys")
         connect_failed = False
+        link_lost = False
 
         try:
             # 非阻塞查找探针。没插硬件时立即返回，不进入 pyOCD 的无限等待模式。
@@ -739,6 +757,7 @@ class RTT_GUI:
             if self.stop_event.is_set():
                 return
 
+            self.ui_call(self.set_status, "连接芯片...")
             self.log(">>> 已检测到调试器，正在连接芯片...", "sys")
             self.session = self.open_session_with_fallback(probes[0])
             if self.stop_event.is_set():
@@ -752,7 +771,11 @@ class RTT_GUI:
                 self.connecting = False
                 self.ui_call(self.set_connected_ui)
                 self.log(">>> 连接成功！已丢弃连接前积压 RTT 数据。", "sys")
-                self.io_loop()
+                link_lost = self.io_loop() == "link_lost"
+                if link_lost and not self.closing:
+                    self.queue_reconnect(map_path, self.AUTO_RECONNECT_DELAY)
+                    self.ui_call(self.set_status, "链路断开，准备重连...")
+                    self.log(f">>> 链路异常中断，{self.AUTO_RECONNECT_DELAY:.1f}s 后自动重连。", "sys")
             else:
                 self.log(">>> RTT 初始化失败，请检查 Map 文件是否匹配。", "sys")
                 self.release_probe_now(session=self.session)
@@ -764,7 +787,7 @@ class RTT_GUI:
                 self.log(f">>> 连接异常: {self.format_exception(e)}", "sys")
         finally:
             self.finish_disconnect()
-            if connect_failed and not self.closing:
+            if connect_failed and not self.closing and not link_lost:
                 self.start_cleanup_cooldown()
 
     def io_loop(self):
@@ -797,7 +820,9 @@ class RTT_GUI:
                             f">>> 连续读取失败 {consecutive_read_errors} 次，已断开: {self.format_exception(e)}",
                             "sys"
                         )
-                        break
+                        return "link_lost"
+                    elif consecutive_read_errors % self.READ_ERROR_LOG_INTERVAL == 0:
+                        self.log(f">>> 读取仍在重试: {consecutive_read_errors}/{self.MAX_READ_ERRORS}", "sys")
 
                     time.sleep(self.RX_ERROR_SLEEP)
                     continue
@@ -807,7 +832,10 @@ class RTT_GUI:
             except Exception as e:
                 if not self.stop_event.is_set():
                     self.log(f">>> 读取中断: {self.format_exception(e)}", "sys")
+                    return "link_lost"
                 break
+
+        return "stopped"
 
     def flush_send_queue(self):
         while self.running and not self.stop_event.is_set():
@@ -911,8 +939,11 @@ class RTT_GUI:
         self.rtt = None
         if not self.closing:
             self.ui_call(self.set_disconnected_ui)
+            if self.pending_reconnect:
+                self.ui_call(self.set_status, "等待自动重连...")
 
     def set_disconnected_ui(self):
+        self.set_status("未连接")
         self.path_entry.config(state="normal")
         self.browse_btn.config(state="normal")
         self.target_entry.config(state="normal")
@@ -922,6 +953,7 @@ class RTT_GUI:
         self.send_btn.config(state="disabled")
 
     def set_connecting_ui(self):
+        self.set_status("连接中...")
         self.path_entry.config(state="disabled")
         self.browse_btn.config(state="disabled")
         self.target_entry.config(state="disabled")
@@ -931,6 +963,7 @@ class RTT_GUI:
         self.send_btn.config(state="disabled")
 
     def set_connected_ui(self):
+        self.set_status("已连接")
         self.path_entry.config(state="disabled")
         self.browse_btn.config(state="disabled")
         self.target_entry.config(state="disabled")
@@ -940,6 +973,7 @@ class RTT_GUI:
         self.send_btn.config(state="normal")
 
     def set_disconnecting_ui(self):
+        self.set_status("断开中...")
         self.path_entry.config(state="disabled")
         self.browse_btn.config(state="disabled")
         self.target_entry.config(state="disabled")
@@ -973,6 +1007,7 @@ class RTT_GUI:
         self.clear_send_queue()
         self.pending_reconnect = False
         self.pending_reconnect_path = ""
+        self.pending_reconnect_delay = None
         self.save_map_path()
         self.save_target_type()
         threading.Thread(target=self._shutdown, daemon=True).start()
