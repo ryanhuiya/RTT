@@ -71,7 +71,6 @@ enable_high_dpi_awareness()
 # ==========================================
 class ManualRTT:
     MAX_RTT_BUFFER_SIZE = 65536
-    MAX_READ_CHUNK = 512
     MAX_WRITE_CHUNK = 64
     WRITE_RETRY_INTERVAL = 0.005
     WRITE_IDLE_TIMEOUT = 1.0
@@ -166,7 +165,7 @@ class ManualRTT:
             return False
 
     def read(self):
-        """读取数据 (Up Buffer: Target -> Host)，小块读取，避免大范围内存访问。"""
+        """读取数据 (Up Buffer: Target -> Host)。"""
         if not self.up_buf:
             return b""
 
@@ -182,24 +181,33 @@ class ManualRTT:
         if wr_off == rd_off:
             return b"" # 无数据
 
+        chunks = []
         if wr_off > rd_off:
-            read_len = min(wr_off - rd_off, self.MAX_READ_CHUNK)
+            read_len = wr_off - rd_off
+            if read_len <= 0 or read_len > size:
+                raise RuntimeError(
+                    f"RTT 读取长度异常: len={read_len}, wr={wr_off}, rd={rd_off}, size={size}"
+                )
+            raw = self.target.read_memory_block8(ptr + rd_off, read_len)
+            chunks.append(bytes(raw))
+            new_rd_off = wr_off
         else:
-            # 回绕时本轮只读 rd_off -> size，下一轮再读 0 -> wr_off。
-            read_len = min(size - rd_off, self.MAX_READ_CHUNK)
+            first_len = size - rd_off
+            second_len = wr_off
+            if first_len < 0 or second_len < 0 or first_len + second_len > size:
+                raise RuntimeError(
+                    f"RTT 回绕读取长度异常: first={first_len}, second={second_len}, wr={wr_off}, rd={rd_off}, size={size}"
+                )
+            if first_len > 0:
+                raw = self.target.read_memory_block8(ptr + rd_off, first_len)
+                chunks.append(bytes(raw))
+            if second_len > 0:
+                raw = self.target.read_memory_block8(ptr, second_len)
+                chunks.append(bytes(raw))
+            new_rd_off = wr_off
 
-        if read_len <= 0 or read_len > size:
-            raise RuntimeError(
-                f"RTT 读取长度异常: len={read_len}, wr={wr_off}, rd={rd_off}, size={size}"
-            )
-
-        raw = self.target.read_memory_block8(ptr + rd_off, read_len)
-
-        new_rd_off = (rd_off + read_len) % size
-
-        # 更新读指针，告诉单片机“我读完了”
         self.target.write32(self.up_buf['rd_off_addr'], new_rd_off)
-        return bytes(raw)
+        return b"".join(chunks)
 
     def write(self, data_bytes):
         """写入数据 (Down Buffer: Host -> Target)，缓冲区小时分段等待发送。"""
@@ -260,10 +268,8 @@ class ManualRTT:
 class RTT_GUI:
     DEFAULT_TARGET_TYPE = "cortex_m"
     PROBE_RELEASE_COOLDOWN = 0.15
-    MAX_READ_ERRORS = 20
-    RX_BATCH_READS = 32
-    RX_BATCH_BYTES = 8192
-    RX_IDLE_SLEEP = 0.003
+    MAX_READ_ERRORS = 100
+    RX_IDLE_SLEEP = 0.01
     RX_ERROR_SLEEP = 0.05
 
     def __init__(self, root):
@@ -338,7 +344,7 @@ class RTT_GUI:
 
         self.set_disconnected_ui()
         self.root.after(50, self.process_ui_queue)
-        self.root.after(600, self.preload_pyocd)
+        self.root.after(50, self.preload_pyocd)
 
     def preload_pyocd(self):
         if self.pyocd_preload_started:
@@ -761,28 +767,6 @@ class RTT_GUI:
             if connect_failed and not self.closing:
                 self.start_cleanup_cooldown()
 
-    def read_rtt_batch(self):
-        chunks = []
-        total_len = 0
-
-        for _ in range(self.RX_BATCH_READS):
-            try:
-                data = self.rtt.read()
-            except Exception:
-                if chunks:
-                    return b"".join(chunks)
-                raise
-
-            if not data:
-                break
-
-            chunks.append(data)
-            total_len += len(data)
-            if total_len >= self.RX_BATCH_BYTES:
-                break
-
-        return b"".join(chunks)
-
     def io_loop(self):
         consecutive_read_errors = 0
 
@@ -794,7 +778,7 @@ class RTT_GUI:
 
                 # 读取数据
                 try:
-                    data = self.read_rtt_batch()
+                    data = self.rtt.read()
                     if consecutive_read_errors:
                         self.log(">>> 读取已恢复。", "sys")
                     consecutive_read_errors = 0
