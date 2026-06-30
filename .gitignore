@@ -8,6 +8,7 @@ RTT_origin/
 # Python cache
 __pycache__/
 *.py[cod]
+.venv/
 
 # PyInstaller/build artifacts
 build/
