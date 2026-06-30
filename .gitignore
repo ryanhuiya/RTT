@@ -1,0 +1,14 @@
+# Upstream/reference RTT viewer folders
+RTTView-master/
+RTTViewer-master/
+rttviewer-master/
+rttviwer*/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# PyInstaller/build artifacts
+build/
+dist/
+*.exe
